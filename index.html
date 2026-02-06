@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Self-Evolving Particle Sandbox</title>
+  <style>
+    :root {
+      --bg: #0f0f12;
+      --panel: #1a1a20;
+      --accent: #00ff9d;
+      --text: #e0e0e0;
+    }
+
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: var(--bg);
+      font-family: 'Courier New', monospace;
+      color: var(--text);
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+
+    #hud {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      width: 380px;
+      background: rgba(26, 26, 32, 0.85);
+      border: 1px solid #333;
+      padding: 20px;
+      border-radius: 8px;
+      backdrop-filter: blur(5px);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+      z-index: 10;
+    }
+
+    h1 {
+      font-size: 16px;
+      margin: 0 0 15px 0;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    .input-group {
+      margin-bottom: 12px;
+    }
+
+    label {
+      display: block;
+      font-size: 12px;
+      margin-bottom: 4px;
+      opacity: 0.7;
+    }
+
+    input[type="password"],
+    textarea {
+      width: 100%;
+      background: #000;
+      border: 1px solid #444;
+      color: var(--accent);
+      padding: 8px;
+      font-family: inherit;
+      font-size: 13px;
+      box-sizing: border-box;
+      border-radius: 4px;
+    }
+
+    textarea {
+      height: 80px;
+      resize: vertical;
+    }
+
+    button {
+      width: 100%;
+      background: var(--accent);
+      color: #000;
+      border: none;
+      padding: 10px;
+      font-weight: bold;
+      cursor: pointer;
+      text-transform: uppercase;
+      border-radius: 4px;
+      transition: opacity 0.2s;
+    }
+
+    button:hover {
+      opacity: 0.8;
+    }
+
+    button:disabled {
+      background: #555;
+      cursor: not-allowed;
+    }
+
+    #status {
+      margin-top: 10px;
+      font-size: 11px;
+      color: #888;
+      text-align: right;
+    }
+
+    .loading {
+      color: #ffeb3b !important;
+    }
+
+    .error {
+      color: #ff5252 !important;
+    }
+  </style>
+</head>
+
+<body>
+
+  <div id="hud">
+    <h1>// Particle Kernel v1.0</h1>
+
+    <div class="input-group">
+      <label>Gemini API Key</label>
+      <input type="password" id="apiKey" placeholder="Paste API Key here...">
+    </div>
+
+    <div class="input-group">
+      <label>Evolution Prompt</label>
+      <textarea id="promptInput" placeholder="E.g., 'Make them swirl around the mouse cursor.'"></textarea>
+    </div>
+
+    <button id="evolveBtn" disabled>Loading Compiler...</button>
+    <div id="status">System Booting...</div>
+  </div>
+
+  <canvas id="canvas"></canvas>
+
+  <script src="https://cdn.jsdelivr.net/npm/assemblyscript@0.27.22/dist/web.js"></script>
+
+  <script type="module">
+    // NOW WE CAN USE THE CLEAN IMPORT!
+    // The script above mapped "assemblyscript/asc" to the correct CDN location.
+    import asc from "assemblyscript/asc";
+
+    // --- CONFIGURATION ---
+    const COUNT = 10000;
+    const BYTES_PER_PARTICLE = 16;
+    const MEMORY_PAGES = Math.ceil((COUNT * BYTES_PER_PARTICLE) / 65536) + 2;
+
+    // --- STATE MANAGEMENT ---
+    const sharedMemory = new WebAssembly.Memory({initial: MEMORY_PAGES});
+    const f32View = new Float32Array(sharedMemory.buffer);
+    let wasmInstance = null;
+
+    // --- INITIALIZATION ---
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    let width = canvas.width = window.innerWidth;
+    let height = canvas.height = window.innerHeight;
+    let mouseX = width / 2;
+    let mouseY = height / 2;
+
+    // Initialize particles
+    for (let i = 0; i < COUNT; i++) {
+      const offset = i * 4;
+      f32View[offset + 0] = Math.random() * width;
+      f32View[offset + 1] = Math.random() * height;
+      f32View[offset + 2] = (Math.random() - 0.5) * 2;
+      f32View[offset + 3] = (Math.random() - 0.5) * 2;
+    }
+
+    // --- DEFAULT KERNEL ---
+    let currentASCode = `
+        export function update(width: f32, height: f32, mx: f32, my: f32): void {
+            for (let i = 0; i < 10000; i++) {
+                let ptr = i * 16;
+                let x = load<f32>(ptr + 0);
+                let y = load<f32>(ptr + 4);
+                let vx = load<f32>(ptr + 8);
+                let vy = load<f32>(ptr + 12);
+
+                vy += 0.1; // Gravity
+                x += vx;
+                y += vy;
+
+                if (y > height) { y = height; vy *= -0.8; }
+                if (x < 0 || x > width) { vx *= -1.0; }
+
+                store<f32>(ptr + 0, x);
+                store<f32>(ptr + 4, y);
+                store<f32>(ptr + 8, vx);
+                store<f32>(ptr + 12, vy);
+            }
+        }`;
+
+    // --- COMPILATION PIPELINE ---
+    async function compileAndLoad(asCode) {
+      updateStatus("Compiling Physics...", "loading");
+
+      try {
+        // 'asc' is now imported directly from the module!
+        const {binary, text, stderr} = await asc.compileString(asCode, {
+          optimizeLevel: 3,
+          runtime: "stub",
+          importMemory: true
+        });
+
+        if (!binary) {
+          console.error("Stderr:", stderr ? stderr.toString() : "Unknown error");
+          throw new Error("Compilation failed (check console)");
+        }
+
+        const module = await WebAssembly.instantiate(binary, {
+          env: {
+            memory: sharedMemory,
+            abort: () => console.error("Wasm Abort"),
+            seed: () => Math.random()
+          }
+        });
+
+        wasmInstance = module.instance;
+        updateStatus("System Ready.", "");
+      } catch (e) {
+        console.error(e);
+        updateStatus("Error: " + e.message, "error");
+      }
+    }
+
+    // --- RENDER LOOP ---
+    function frame() {
+      ctx.fillStyle = 'rgba(15, 15, 18, 0.3)';
+      ctx.fillRect(0, 0, width, height);
+
+      if (wasmInstance) {
+        wasmInstance.exports.update(width, height, mouseX, mouseY);
+      }
+
+      ctx.fillStyle = '#00ff9d';
+      for (let i = 0; i < COUNT; i++) {
+        const offset = i * 4;
+        const x = f32View[offset + 0];
+        const y = f32View[offset + 1];
+        if (x >= 0 && x <= width && y >= 0 && y <= height) {
+          ctx.fillRect(x, y, 2, 2);
+        }
+      }
+      requestAnimationFrame(frame);
+    }
+
+    // --- EVOLUTION LOGIC ---
+    async function evolvePhysics() {
+      const apiKey = document.getElementById('apiKey').value;
+      const userPrompt = document.getElementById('promptInput').value;
+      const btn = document.getElementById('evolveBtn');
+
+      if (!apiKey) {alert("Please enter a Gemini API Key."); return;}
+      if (!userPrompt) {alert("Please enter a prompt."); return;}
+
+      btn.disabled = true;
+      updateStatus("Consulting AI...", "loading");
+
+      const systemPrompt = `
+        You are an expert AssemblyScript Physics Kernel generator.
+        Your goal is to write a high-performance particle update function that compiles strictly to WebAssembly.
+
+        CRITICAL COMPILER RULES (Failure to follow these causes crashes):
+        1. NO IMPLICIT CASTING:
+           - All standard math functions (Math.sin, Math.cos, Math.sqrt, Math.random) return 'f64'.
+           - Your variables (x, y, vx, vy) are 'f32'.
+           - YOU MUST CAST ALL MATH RESULTS TO f32.
+           - WRONG: let dist = Math.sqrt(dx*dx + dy*dy); // Returns f64 -> Error
+           - RIGHT: let dist = f32(Math.sqrt(dx*dx + dy*dy)); // Casts to f32 -> Correct
+
+        2. CONSTANT TYPES:
+           - Do not use plain numbers like '0.5' (which is f64).
+           - Use 'f32(0.5)' or cast operations immediately.
+
+        3. MEMORY OPERATIONS:
+           - Use 'load<f32>(ptr)' and 'store<f32>(ptr, val)'.
+           - Do not use classes, arrays, or objects. Raw pointer arithmetic only.
+
+        CONTEXT:
+        - Total Particles: 10,000
+        - Data Layout: [x, y, vx, vy] interleaved (stride 16 bytes).
+        - Available Inputs: width (f32), height (f32), mx (f32), my (f32).
+
+        YOUR TASK:
+        Write the body of the 'update' function.
+        Signature: export function update(width: f32, height: f32, mx: f32, my: f32): void
+        Output ONLY raw code. No markdown. No comments outside the code.
+
+        TEMPLATE TO FOLLOW:
+        export function update(width: f32, height: f32, mx: f32, my: f32): void {
+          for (let i = 0; i < 10000; i++) {
+            let ptr = i * 16;
+            let x = load<f32>(ptr + 0);
+            let y = load<f32>(ptr + 4);
+            
+            // ... CALCULATE NEW X/Y HERE using explicit f32() casts ...
+            
+            store<f32>(ptr + 0, x);
+            store<f32>(ptr + 4, y);
+          }
+        }
+        `;
+
+      try {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            contents: [{
+              parts: [{text: systemPrompt + "\nUser Request: " + userPrompt}]
+            }]
+          })
+        });
+
+        const data = await response.json();
+        if (data.error) throw new Error(data.error.message);
+
+        let rawCode = data.candidates[0].content.parts[0].text;
+        rawCode = rawCode.replace(/```assemblyscript/g, "").replace(/```typescript/g, "").replace(/```/g, "").trim();
+
+        console.log("AI Generated Code:\n", rawCode);
+        await compileAndLoad(rawCode);
+
+      } catch (err) {
+        console.error(err);
+        updateStatus("Error: " + err.message, "error");
+      }
+      btn.disabled = false;
+    }
+
+    // --- UTILS ---
+    function updateStatus(msg, cls) {
+      const el = document.getElementById('status');
+      el.textContent = msg;
+      el.className = cls;
+    }
+
+    // --- STARTUP ---
+    document.getElementById('evolveBtn').addEventListener('click', evolvePhysics);
+    window.addEventListener('resize', () => {width = canvas.width = window.innerWidth; height = canvas.height = window.innerHeight;});
+    window.addEventListener('mousemove', (e) => {mouseX = e.clientX; mouseY = e.clientY;});
+
+    // Enable UI immediately since the import map handles loading
+    document.getElementById('evolveBtn').disabled = false;
+    document.getElementById('evolveBtn').textContent = 'Compile New Kernel';
+
+    frame();
+    compileAndLoad(currentASCode);
+  </script>
+</body>
+
+</html>
